@@ -78,10 +78,10 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
 class FundingRateArbitrage(StrategyV2Base):
     quote_markets_map = {
         "hyperliquid_perpetual": "USD",
-        "binance_perpetual": "USDT"
+        "bybit_perpetual": "USDT"
     }
     funding_payment_interval_map = {
-        "binance_perpetual": 60 * 60 * 8,
+        "bybit_perpetual": 60 * 60 * 8,
         "hyperliquid_perpetual": 60 * 60 * 1
     }
     funding_profitability_interval = 60 * 60 * 24
@@ -191,7 +191,8 @@ class FundingRateArbitrage(StrategyV2Base):
                         trade_side = TradeType.BUY if rate_connector_1 < rate_connector_2 else TradeType.SELL
                         highest_profitability = funding_rate_diff
                         best_combination = (connector_1, connector_2, trade_side, funding_rate_diff)
-        return best_combination
+
+        return best_combination, funding_rate_diff
 
     def get_normalized_funding_rate_in_seconds(self, funding_info_report, connector_name):
         return funding_info_report[connector_name].rate / self.funding_payment_interval_map.get(connector_name, 60 * 60 * 8)
@@ -209,7 +210,10 @@ class FundingRateArbitrage(StrategyV2Base):
         for token in self.config.tokens:
             if token not in self.active_funding_arbitrages:
                 funding_info_report = self.get_funding_info_by_token(token)
-                best_combination = self.get_most_profitable_combination(funding_info_report)
+                best_combination, funding_rate_diff = self.get_most_profitable_combination(funding_info_report)
+                if best_combination is None:
+                    self.logger().info(f"No profitable combination found for {token}, funding rate diff if {funding_rate_diff:.4f} skipping...")
+                    continue
                 connector_1, connector_2, trade_side, expected_profitability = best_combination
                 if expected_profitability >= self.config.min_funding_rate_profitability:
                     current_profitability = self.get_current_profitability_after_fees(
@@ -236,6 +240,9 @@ class FundingRateArbitrage(StrategyV2Base):
                     }
                     return [CreateExecutorAction(executor_config=position_executor_config_1),
                             CreateExecutorAction(executor_config=position_executor_config_2)]
+                else:
+                    self.logger().info(f"Funding rate profitability for {token} with connectors {connector_1} and {connector_2} is {expected_profitability:.4f}, "
+                                       f"which is below the minimum profitability to enter {self.config.min_funding_rate_profitability:.4f}. Skipping...")
         return create_actions
 
     def stop_actions_proposal(self) -> List[StopExecutorAction]:
