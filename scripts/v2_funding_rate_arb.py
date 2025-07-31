@@ -32,9 +32,9 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
             "prompt_on_new": True}
     )
     connectors: Set[str] = Field(
-        default="hyperliquid_perpetual,binance_perpetual",
+        default="hyperliquid_perpetual,bybit_perpetual",
         json_schema_extra={
-            "prompt": lambda mi: "Enter the connectors separated by commas (e.g. hyperliquid_perpetual,binance_perpetual): ",
+            "prompt": lambda mi: "Enter the connectors separated by commas (e.g. hyperliquid_perpetual,bybit_perpetual): ",
             "prompt_on_new": True}
     )
     tokens: Set[str] = Field(
@@ -44,7 +44,7 @@ class FundingRateArbitrageConfig(StrategyV2ConfigBase):
     position_size_quote: Decimal = Field(
         default=100,
         json_schema_extra={
-            "prompt": lambda mi: "Enter the position size in quote asset (e.g. order amount 100 will open 100 long on hyperliquid and 100 short on binance): ",
+            "prompt": lambda mi: "Enter the position size in quote asset (e.g. order amount 100 will open 100 long on hyperliquid and 100 short on bybit): ",
             "prompt_on_new": True
         }
     )
@@ -128,7 +128,10 @@ class FundingRateArbitrage(StrategyV2Base):
         funding_rates = {}
         for connector_name, connector in self.connectors.items():
             trading_pair = self.get_trading_pair_for_connector(token, connector_name)
+            res = connector.get_funding_info(trading_pair)
+            self.logger().info(f"Funding info raw result for {trading_pair} on {connector_name}: {res}")
             funding_rates[connector_name] = connector.get_funding_info(trading_pair)
+            self.logger().info(f"Funding rate for {trading_pair} on {connector_name}: {funding_rates[connector_name].rate}")
         return funding_rates
 
     def get_current_profitability_after_fees(self, token: str, connector_1: str, connector_2: str, side: TradeType):
