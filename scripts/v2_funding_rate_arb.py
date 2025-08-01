@@ -128,10 +128,7 @@ class FundingRateArbitrage(StrategyV2Base):
         funding_rates = {}
         for connector_name, connector in self.connectors.items():
             trading_pair = self.get_trading_pair_for_connector(token, connector_name)
-            res = connector.get_funding_info(trading_pair)
-            self.logger().info(f"Funding info raw result for {trading_pair} on {connector_name}: {res}")
             funding_rates[connector_name] = connector.get_funding_info(trading_pair)
-            self.logger().info(f"Funding rate for {trading_pair} on {connector_name}: {funding_rates[connector_name].rate}")
         return funding_rates
 
     def get_current_profitability_after_fees(self, token: str, connector_1: str, connector_2: str, side: TradeType):
@@ -198,7 +195,12 @@ class FundingRateArbitrage(StrategyV2Base):
         return best_combination, funding_rate_diff
 
     def get_normalized_funding_rate_in_seconds(self, funding_info_report, connector_name):
-        return funding_info_report[connector_name].rate / self.funding_payment_interval_map.get(connector_name, 60 * 60 * 8)
+        if funding_info_report[connector_name].funding_interval:
+            rate_in_seconds = (funding_info_report[connector_name].rate / (funding_info_report[connector_name].funding_interval * 60)) 
+        else:
+            rate_in_seconds = funding_info_report[connector_name].rate / self.funding_payment_interval_map.get(connector_name, 60 * 60 * 1)
+        
+        return rate_in_seconds
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         """
