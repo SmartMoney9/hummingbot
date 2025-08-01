@@ -7,19 +7,21 @@ class FundingInfo:
     """
     Data object that details the funding information of a perpetual market.
     """
-
-    def __init__(self,
-                 trading_pair: str,
-                 index_price: Decimal,
-                 mark_price: Decimal,
-                 next_funding_utc_timestamp: int,
-                 rate: Decimal,
-                 ):
+    def __init__(
+        self,
+        trading_pair: str,
+        index_price: Decimal,
+        mark_price: Decimal,
+        next_funding_utc_timestamp: int,
+        rate: Decimal,
+        funding_interval: Optional[int] = None
+    ):
         self._trading_pair = trading_pair
         self._index_price = index_price
         self._mark_price = mark_price
         self._next_funding_utc_timestamp = next_funding_utc_timestamp
         self._rate = rate
+        self._funding_interval = funding_interval
 
     @property
     def trading_pair(self) -> str:
@@ -52,6 +54,10 @@ class FundingInfo:
     @property
     def rate(self) -> Decimal:
         return self._rate
+
+    @property
+    def funding_interval(self) -> Optional[int]:
+        return self._funding_interval
 
     @rate.setter
     def rate(self, rate):
