@@ -34,6 +34,7 @@ class BybitPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._nonce_provider = NonceCreator.for_microseconds()
+        self._funding_info_lock = asyncio.Lock()
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -88,6 +89,27 @@ class BybitPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             funding_interval=funding_interval,
         )
         return funding_info
+    
+    async def listen_for_funding_info(self, output: asyncio.Queue):
+        """
+        Reads the funding info events queue and updates the local funding info information.
+        """
+        async with self._funding_info_lock:
+            while True:
+                try:
+                    for pair in self._trading_pairs:
+                        funding_info = await self.get_funding_info(pair)
+                        info_update = FundingInfoUpdate(pair)
+                        info_update.index_price = funding_info.index_price
+                        info_update.mark_price = funding_info.mark_price
+                        info_update.next_funding_utc_timestamp = funding_info.next_funding_utc_timestamp
+                        info_update.rate = funding_info.rate
+                        output.put_nowait(info_update)
+                    await asyncio.sleep(CONSTANTS.FUNDING_RATE_UPDATE_INTERNAL_SECOND)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger().exception("Unexpected error when processing public funding info updates from exchange")
 
     async def listen_for_subscriptions(self):
         """

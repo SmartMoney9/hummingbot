@@ -23,6 +23,7 @@ WSS_LINEAR_PRIVATE_URLS = {
     "bybit_perpetual_testnet": "wss://stream-testnet.bybit.com/v5/private"
 }
 WS_HEARTBEAT_TIME_INTERVAL = 20.0
+FUNDING_RATE_UPDATE_INTERNAL_SECOND = 15  # seconds
 
 # unit in millisecond and default value is 5,000, to specify how long an HTTP request is valid.
 # It is also used to prevent replay attacks.
