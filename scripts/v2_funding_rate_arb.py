@@ -199,7 +199,6 @@ class FundingRateArbitrage(StrategyV2Base):
             rate_in_seconds = (funding_info_report[connector_name].rate / (funding_info_report[connector_name].funding_interval * 60)) 
         else:
             rate_in_seconds = funding_info_report[connector_name].rate / self.funding_payment_interval_map.get(connector_name, 60 * 60 * 1)
-        
         return rate_in_seconds
 
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
@@ -213,41 +212,62 @@ class FundingRateArbitrage(StrategyV2Base):
         """
         create_actions = []
         for token in self.config.tokens:
-            if token not in self.active_funding_arbitrages:
-                funding_info_report = self.get_funding_info_by_token(token)
-                best_combination, funding_rate_diff = self.get_most_profitable_combination(funding_info_report)
-                if best_combination is None:
-                    self.logger().info(f"No profitable combination found for {token}, funding rate diff if {funding_rate_diff:.4f} skipping...")
-                    continue
-                connector_1, connector_2, trade_side, expected_profitability = best_combination
-                if expected_profitability >= self.config.min_funding_rate_profitability:
-                    current_profitability = self.get_current_profitability_after_fees(
-                        token, connector_1, connector_2, trade_side
-                    )
-                    if self.config.trade_profitability_condition_to_enter:
-                        if current_profitability < 0:
-                            self.logger().info(f"Best Combination: {connector_1} | {connector_2} | {trade_side}"
-                                               f"Funding rate profitability: {expected_profitability}"
-                                               f"Trading profitability after fees: {current_profitability}"
-                                               f"Trade profitability is negative, skipping...")
-                            continue
-                    self.logger().info(f"Best Combination: {connector_1} | {connector_2} | {trade_side}"
-                                       f"Funding rate profitability: {expected_profitability}"
-                                       f"Trading profitability after fees: {current_profitability}"
-                                       f"Starting executors...")
-                    position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(token, connector_1, connector_2, trade_side)
-                    self.active_funding_arbitrages[token] = {
-                        "connector_1": connector_1,
-                        "connector_2": connector_2,
-                        "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
-                        "side": trade_side,
-                        "funding_payments": [],
-                    }
-                    return [CreateExecutorAction(executor_config=position_executor_config_1),
-                            CreateExecutorAction(executor_config=position_executor_config_2)]
-                else:
-                    self.logger().info(f"Funding rate profitability for {token} with connectors {connector_1} and {connector_2} is {expected_profitability:.4f}, "
-                                       f"which is below the minimum profitability to enter {self.config.min_funding_rate_profitability:.4f}. Skipping...")
+            already_open = any(
+                token in executor.trading_pair for executor in self.get_all_executors() if not executor.is_done
+            )
+            if token in self.active_funding_arbitrages or already_open:
+                continue
+
+            funding_info_report = self.get_funding_info_by_token(token)
+            best_combination, funding_rate_diff = self.get_most_profitable_combination(funding_info_report)
+            if best_combination is None:
+                self.logger().info(
+                    f"No profitable combination found for {token}, "
+                    f"funding rate diff is {funding_rate_diff:.4f}, skipping..."
+                )
+                continue
+
+            connector_1, connector_2, trade_side, expected_profitability = best_combination
+            if expected_profitability < self.config.min_funding_rate_profitability:
+                self.logger().info(
+                    f"Funding rate profitability for {token} with connectors {connector_1} and {connector_2} "
+                    f"is {expected_profitability:.4f}, which is below the minimum profitability "
+                    f"{self.config.min_funding_rate_profitability:.4f}. Skipping..."
+                )
+                continue
+
+            current_profitability = self.get_current_profitability_after_fees(token, connector_1, connector_2, trade_side)
+            if self.config.trade_profitability_condition_to_enter and current_profitability < 0:
+                self.logger().info(
+                    f"Best Combination: {connector_1} | {connector_2} | {trade_side} | "
+                    f"Funding rate profitability: {expected_profitability:.4f} | "
+                    f"Trading profitability after fees: {current_profitability:.4f} -> Skipping..."
+                )
+                continue
+
+            self.logger().info(
+                f"Best Combination: {connector_1} | {connector_2} | {trade_side} | "
+                f"Funding rate profitability: {expected_profitability:.4f} | "
+                f"Trading profitability after fees: {current_profitability:.4f} -> Starting executors..."
+            )
+
+            position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(
+                token, connector_1, connector_2, trade_side
+            )
+            self.active_funding_arbitrages[token] = {
+                "connector_1": connector_1,
+                "connector_2": connector_2,
+                "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
+                "side": trade_side,
+                "funding_payments": [],
+            }
+            create_actions.extend(
+                [
+                    CreateExecutorAction(executor_config=position_executor_config_1),
+                    CreateExecutorAction(executor_config=position_executor_config_2),
+                ]
+            )
+
         return create_actions
 
     def stop_actions_proposal(self) -> List[StopExecutorAction]:
@@ -257,28 +277,57 @@ class FundingRateArbitrage(StrategyV2Base):
         If that PNL is greater than the profitability_to_take_profit
         """
         stop_executor_actions = []
-        for token, funding_arbitrage_info in self.active_funding_arbitrages.items():
+
+        for token, funding_arbitrage_info in list(self.active_funding_arbitrages.items()):
             executors = self.filter_executors(
-                executors=self.get_all_executors(),
-                filter_func=lambda x: x.id in funding_arbitrage_info["executors_ids"]
+                executors=self.get_all_executors(), filter_func=lambda x: x.id in funding_arbitrage_info["executors_ids"]
             )
-            funding_payments_pnl = sum(funding_payment.amount for funding_payment in funding_arbitrage_info["funding_payments"])
+
+            funding_payments_pnl = sum(payment.amount for payment in funding_arbitrage_info["funding_payments"])
+
             executors_pnl = sum(executor.net_pnl_quote for executor in executors)
-            take_profit_condition = executors_pnl + funding_payments_pnl > self.config.profitability_to_take_profit * self.config.position_size_quote
+
+            take_profit_condition = (
+                executors_pnl + funding_payments_pnl
+                >= self.config.profitability_to_take_profit * self.config.position_size_quote
+            )
+
             funding_info_report = self.get_funding_info_by_token(token)
             if funding_arbitrage_info["side"] == TradeType.BUY:
-                funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
+                funding_rate_diff = self.get_normalized_funding_rate_in_seconds(
+                    funding_info_report, funding_arbitrage_info["connector_2"]
+                ) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
             else:
-                funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
-            current_funding_condition = funding_rate_diff * self.funding_profitability_interval < self.config.funding_rate_diff_stop_loss
+                funding_rate_diff = self.get_normalized_funding_rate_in_seconds(
+                    funding_info_report, funding_arbitrage_info["connector_1"]
+                ) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
+
+            stop_loss_condition = funding_rate_diff < self.config.funding_rate_diff_stop_loss
+            self.logger().info(
+                f"[DEBUG TP] {token} | exec_pnl={executors_pnl:.5f} | funding_pnl={funding_payments_pnl:.5f} | "
+                f"TP threshold={self.config.profitability_to_take_profit * self.config.position_size_quote:.5f}"
+            )
+
             if take_profit_condition:
-                self.logger().info("Take profit profitability reached, stopping executors")
-                self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
-                stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
-            elif current_funding_condition:
-                self.logger().info("Funding rate difference reached for stop loss, stopping executors")
-                self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
-                stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+                self.logger().info(
+                    f"[{token}] ✅ Take profit reached "
+                    f"(Executors PnL: {executors_pnl:.4f}, Funding PnL: {funding_payments_pnl:.4f}) — stopping executors"
+                )
+            elif stop_loss_condition:
+                self.logger().info(
+                    f"[{token}] 🛑 Stop loss triggered. "
+                    f"Funding rate diff: {funding_rate_diff:.6f} < Threshold: {self.config.funding_rate_diff_stop_loss:.6f} — stopping executors"
+                )
+            else:
+                continue  
+
+            stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+
+            self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+
+            self.active_funding_arbitrages.pop(token, None)
+            self.stopped_funding_arbitrages[token] = []
+
         return stop_executor_actions
 
     def did_complete_funding_payment(self, funding_payment_completed_event: FundingPaymentCompletedEvent):
