@@ -45,6 +45,10 @@ ORDER_BOOKS_URL = "/api/v1/orderBooks"
 
 ORDER_BOOK_DETAILS_URL = "/api/v1/orderBookDetails"
 
+ORDER_BOOK_ORDERS_URL = "/api/v1/orderBookOrders"
+
+FUNDING_URL = "/api/v1/funding-rates"
+
 CANCEL_ORDER_URL = "/exchange"
 
 CREATE_ORDER_URL = "/exchange"
@@ -135,6 +139,8 @@ RATE_LIMITS = [
     RateLimit(limit_id="/api/v1/orderBooks", limit=MAX_REQUESTS_PER_MIN, time_interval=ONE_MIN, weight=1,
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
     RateLimit(limit_id="/api/v1/orderBookDetails", limit=MAX_REQUESTS_PER_MIN, time_interval=ONE_MIN, weight=1,
+              linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
+    RateLimit(limit_id="/api/v1/funding-rates", limit=MAX_REQUESTS_PER_MIN, time_interval=ONE_MIN, weight=1,
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
 
     # Weight 5

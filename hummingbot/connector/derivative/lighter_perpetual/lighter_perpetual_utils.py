@@ -40,6 +40,15 @@ class LighterPerpetualConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
+    lighter_perpetual_api_secret: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Arbitrum wallet private key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
     model_config = ConfigDict(title="lighter_perpetual")
 
 

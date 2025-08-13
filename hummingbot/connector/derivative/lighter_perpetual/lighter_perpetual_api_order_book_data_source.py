@@ -4,6 +4,7 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
+from hummingbot.client.config import client_config_map
 import hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_constants as CONSTANTS
 import hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_web_utils as web_utils
 
@@ -32,7 +33,8 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             trading_pairs: List[str],
             connector: 'LighterPerpetualDerivative',
             api_factory: WebAssistantsFactory,
-            domain: str = CONSTANTS.DOMAIN
+            domain: str = CONSTANTS.DOMAIN,
+            initial_order_book = None
     ):
         super().__init__(trading_pairs)
         self._connector = connector
@@ -41,6 +43,7 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._trading_pairs: List[str] = trading_pairs
         self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self._snapshot_messages_queue_key = "order_book_snapshot"
+        self._initial_order_book = initial_order_book
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -51,14 +54,14 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         response: List = await self._request_complete_funding_info(trading_pair)
         ex_trading_pair = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         coin = ex_trading_pair.split("-")[0]
-        for index, i in enumerate(response[0]['universe']):
-            if i['name'] == coin:
+        for index, i in enumerate(response['funding_rates']):
+            if i['symbol'] == coin:
                 funding_info = FundingInfo(
                     trading_pair=trading_pair,
-                    index_price=Decimal(response[1][index]['oraclePx']),
-                    mark_price=Decimal(response[1][index]['markPx']),
+                    index_price=0,
+                    mark_price=0,
                     next_funding_utc_timestamp=self._next_funding_time(),
-                    rate=Decimal(response[1][index]['funding']),
+                    rate=i['rate'],
                 )
                 return funding_info
 
@@ -86,6 +89,8 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 await self._sleep(CONSTANTS.FUNDING_RATE_UPDATE_INTERNAL_SECOND)
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+        if not self._initial_order_book:
+            await self._connector.make_init_order_book_snapshot_request()
         ex_trading_pair = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         coin = ex_trading_pair.split("-")[0]
         params = {
@@ -209,8 +214,7 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         pass
 
     async def _request_complete_funding_info(self, trading_pair: str):
-        data = await self._connector._api_post(path_url=CONSTANTS.EXCHANGE_INFO_URL,
-                                               data={"type": CONSTANTS.ASSET_CONTEXT_TYPE})
+        data = await self._connector._api_get(path_url=CONSTANTS.FUNDING_URL)
         return data
 
     def _next_funding_time(self) -> int:
