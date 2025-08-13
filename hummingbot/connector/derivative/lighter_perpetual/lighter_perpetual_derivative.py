@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, AsyncIterable, Dict, List, Optional, Tuple
 
 from bidict import bidict
+from pydantic import SecretStr
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.derivative.lighter_perpetual import (
@@ -50,11 +51,13 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             self,
             client_config_map: "ClientConfigAdapter",
             lighter_perpetual_wallet_address: str = None,
+            lighter_perpetual_api_secret: SecretStr = None,
             trading_pairs: Optional[List[str]] = None,
             trading_required: bool = True,
             domain: str = CONSTANTS.DOMAIN,
     ):
         self.lighter_perpetual_wallet_address = lighter_perpetual_wallet_address
+        self.lighter_perpetual_api_secret = lighter_perpetual_api_secret
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._domain = domain
@@ -62,7 +65,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         self._last_trade_history_timestamp = None
         self.coin_to_asset: Dict[str, int] = {}
         self.market_tickers = []
-        print("Initializing Lighter Perpetual Derivative...")
+        self.initial_order_book = None
         super().__init__(client_config_map)
 
     @property
@@ -73,7 +76,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def authenticator(self) -> Optional[LighterPerpetualAuth]:
         if self._trading_required:
-            return LighterPerpetualAuth(self.lighter_perpetual_wallet_address)
+            return LighterPerpetualAuth(self.lighter_perpetual_wallet_address, self.lighter_perpetual_api_secret)
         return None
 
     @property
@@ -164,6 +167,17 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                                              data={"type": CONSTANTS.ASSET_CONTEXT_TYPE})
         return exchange_info
 
+    async def make_init_order_book_snapshot_request(self) -> Any:
+        order_book_details_response = await self._api_get(path_url=CONSTANTS.ORDER_BOOK_DETAILS_URL)
+
+        if order_book_details_response and order_book_details_response.get("order_book_details") and order_book_details_response.get("code") == 200:
+            self.initial_order_book = order_book_details_response.get("order_book_details")
+            return order_book_details_response
+        else:
+            self.logger().error(f"Failed to fetch initial order book snapshot: {order_book_details_response}")
+
+        return None
+
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
 
@@ -224,6 +238,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self.domain,
+            initial_order_book=self.initial_order_book,
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
