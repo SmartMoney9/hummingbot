@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import ConfigDict, Field, SecretStr, field_validator
+from pydantic import ConfigDict, Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
@@ -40,10 +40,19 @@ class LighterPerpetualConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
-    lighter_perpetual_api_secret: SecretStr = Field(
+    lighter_perpetual_wallet_private_key: SecretStr = Field(
         default=...,
         json_schema_extra={
-            "prompt": "Enter your Arbitrum wallet private key",
+            "prompt": "Enter your Lighter wallet private key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    lighter_perpetual_api_secret_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Lighter API secret key (use only secret key with index 0)",
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,
