@@ -1,8 +1,11 @@
-import os
 import asyncio
+import os
 import time
-from collections import deque
-from typing import Dict, List, Set, Optional, Deque
+from typing import Any, Dict, List, Set
+from uuid import uuid4
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 try:
     from hummingbot.connector.derivative.hyperliquid_perpetual import hyperliquid_perpetual_constants as HL_CONSTANTS
@@ -18,8 +21,8 @@ from pydantic import Field, field_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.clock import Clock
-from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 
 
 class FundingRateCollectorConfig(StrategyV2ConfigBase):
@@ -50,7 +53,7 @@ class FundingRateCollectorConfig(StrategyV2ConfigBase):
     output_dir: str = Field(
         default="data/funding_rates",
         json_schema_extra={
-            "prompt": lambda mi: "Enter output directory for funding CSV files (e.g. data/funding_rates): ",
+            "prompt": lambda mi: "Enter output directory for funding files (e.g. data/funding_rates): ",
             "prompt_on_new": True,
         },
     )
@@ -106,7 +109,6 @@ class FundingRateCollector(StrategyV2Base):
         os.makedirs(self.config.output_dir, exist_ok=True)
         self._poll_offsets = {}
         self._collecting = False
-
 
     @classmethod
     def init_markets(cls, config: FundingRateCollectorConfig):  # type: ignore
@@ -199,7 +201,9 @@ class FundingRateCollector(StrategyV2Base):
                     if connector is not None and len(pairs) == 0:
                         self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: no pairs yet to collect funding.")
                     continue
-                rows: List[str] = []
+
+                records: List[Dict[str, Any]] = []
+                date_str = time.strftime('%Y-%m-%d', time.gmtime(timestamp))
 
                 # Hyperliquid optimized batch path (optional)
                 if (connector_name == "hyperliquid_perpetual" and HL_CONSTANTS is not None
@@ -223,15 +227,18 @@ class FundingRateCollector(StrategyV2Base):
                             rate = m.get("funding")
                             if rate is None:
                                 continue
-                            rows.append(f"{int(timestamp)},{tp},{rate},3600,{next_funding}")
-                        if rows:
-                            file_path = os.path.join(self.config.output_dir, f"{connector_name}_funding_rates.csv")
-                            file_exists = os.path.isfile(file_path)
-                            with open(file_path, 'a') as f:
-                                if not file_exists:
-                                    f.write("timestamp,trading_pair,rate,funding_interval,next_funding_utc_timestamp\n")
-                                f.write("\n".join(rows) + "\n")
-                            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(rows)} funding rows (batch).")
+                            records.append({
+                                "timestamp": int(timestamp),
+                                "trading_pair": tp,
+                                "rate": rate,
+                                "funding_interval": 3600,
+                                "next_funding_utc_timestamp": next_funding,
+                                "connector": connector_name,
+                                "date": date_str,
+                            })
+                        if records:
+                            self._persist_records(connector_name, records)
+                            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(records)} funding rows (batch).")
                         else:
                             self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding produced 0 rows.")
                         continue  # proceed to next connector after batch path
@@ -247,7 +254,6 @@ class FundingRateCollector(StrategyV2Base):
                         if isinstance(data, dict):
                             rates = data.get("funding_rates", []) or []
                         elif isinstance(data, list):
-                            # Fallback if endpoint ever returns a list
                             rates = data
 
                         rate_map = {}
@@ -269,15 +275,18 @@ class FundingRateCollector(StrategyV2Base):
                             rate = m.get("rate")
                             if rate is None:
                                 continue
-                            rows.append(f"{int(timestamp)},{tp},{rate},3600,{next_funding}")
-                        if rows:
-                            file_path = os.path.join(self.config.output_dir, f"{connector_name}_funding_rates.csv")
-                            file_exists = os.path.isfile(file_path)
-                            with open(file_path, 'a') as f:
-                                if not file_exists:
-                                    f.write("timestamp,trading_pair,rate,funding_interval,next_funding_utc_timestamp\n")
-                                f.write("\n".join(rows) + "\n")
-                            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(rows)} funding rows (batch).")
+                            records.append({
+                                "timestamp": int(timestamp),
+                                "trading_pair": tp,
+                                "rate": rate,
+                                "funding_interval": 3600,
+                                "next_funding_utc_timestamp": next_funding,
+                                "connector": connector_name,
+                                "date": date_str,
+                            })
+                        if records:
+                            self._persist_records(connector_name, records)
+                            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(records)} funding rows (batch).")
                         else:
                             self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding produced 0 rows.")
                         continue  # proceed to next connector after batch path
@@ -312,13 +321,12 @@ class FundingRateCollector(StrategyV2Base):
                     except Exception as e:
                         return tp, None, e
 
-                tasks = [fetch_funding(tp) for tp in target_pairs]
-                # Batch size: static moderate chunk (avoid huge gather); adjustable if needed
                 batch_size = 200
                 errors_this_cycle = 0
                 attempts_this_cycle = 0
-                for i in range(0, len(tasks), batch_size):
-                    batch = tasks[i:i + batch_size]
+                for i in range(0, len(target_pairs), batch_size):
+                    batch_pairs = target_pairs[i:i + batch_size]
+                    batch = [fetch_funding(tp) for tp in batch_pairs]
                     try:
                         results = await asyncio.gather(*batch, return_exceptions=True)
                     except Exception as e:
@@ -340,19 +348,22 @@ class FundingRateCollector(StrategyV2Base):
                             continue
                         funding_interval = getattr(result, 'funding_interval', None)
                         next_funding = getattr(result, 'next_funding_utc_timestamp', None)
-                        rows.append(f"{int(timestamp)},{tp},{rate},{funding_interval},{next_funding}")
+                        records.append({
+                            "timestamp": int(timestamp),
+                            "trading_pair": tp,
+                            "rate": rate,
+                            "funding_interval": funding_interval,
+                            "next_funding_utc_timestamp": next_funding,
+                            "connector": connector_name,
+                            "date": date_str,
+                        })
                 # Simple visibility if we encountered errors.
                 if errors_this_cycle and attempts_this_cycle:
                     self.logger().info(
                         f"[FUNDING-COLLECTOR] {connector_name}: {errors_this_cycle}/{attempts_this_cycle} funding fetch errors this cycle.")
-                if rows:
-                    file_path = os.path.join(self.config.output_dir, f"{connector_name}_funding_rates.csv")
-                    file_exists = os.path.isfile(file_path)
-                    with open(file_path, 'a') as f:
-                        if not file_exists:
-                            f.write("timestamp,trading_pair,rate,funding_interval,next_funding_utc_timestamp\n")
-                        f.write("\n".join(rows) + "\n")
-                    self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(rows)} funding rows.")
+                if records:
+                    self._persist_records(connector_name, records)
+                    self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(records)} funding rows.")
                 else:
                     self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: no funding rows this cycle.")
         finally:
@@ -386,3 +397,45 @@ class FundingRateCollector(StrategyV2Base):
         discovered = {k: len(v) for k, v in self._connector_pairs.items()}
         lines = ["Funding Rate Collector", f"Pairs discovered: {discovered}"]
         return "\n".join(lines)
+
+    def _persist_records(self, connector_name: str, records: List[Dict[str, Any]]):
+        if not records:
+            return
+        try:
+            self._parquet_append(connector_name, records)
+            return
+
+        except Exception as e:
+            self.logger().warning(f"[FUNDING-COLLECTOR] CSV write also failed: {e}.")
+
+    def _parquet_append(self, connector_name: str, records: List[Dict[str, Any]]):
+        by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for r in records:
+            ts = r.get('timestamp') or time.time()
+            d = time.strftime('%Y-%m-%d', time.gmtime(int(ts)))
+            by_date.setdefault(d, []).append(r)
+
+        base_dir = os.path.join(self.config.output_dir, 'parquet', connector_name)
+        os.makedirs(base_dir, exist_ok=True)
+
+        for date_str, recs in by_date.items():
+            day_dir = os.path.join(base_dir, date_str)
+            os.makedirs(day_dir, exist_ok=True)
+
+            def to_float(v):
+                try:
+                    return float(v) if v is not None else None
+                except Exception:
+                    return None
+
+            table = pa.table({
+                'timestamp': pa.array([int(r.get('timestamp')) if r.get('timestamp') is not None else None for r in recs], type=pa.int64()),
+                'trading_pair': pa.array([r.get('trading_pair') for r in recs], type=pa.string()),
+                'rate': pa.array([to_float(r.get('rate')) for r in recs], type=pa.float64()),
+                'funding_interval': pa.array([int(r.get('funding_interval')) if r.get('funding_interval') is not None else None for r in recs], type=pa.int64()),
+                'next_funding_utc_timestamp': pa.array([int(r.get('next_funding_utc_timestamp')) if r.get('next_funding_utc_timestamp') is not None else None for r in recs], type=pa.int64()),
+            })
+
+            fname = f"part-{int(time.time())}-{uuid4().hex[:8]}.parquet"
+            file_path = os.path.join(day_dir, fname)
+            pq.write_table(table, file_path, compression='zstd')
