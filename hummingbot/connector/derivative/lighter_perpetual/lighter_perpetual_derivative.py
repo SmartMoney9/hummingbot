@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-from importlib.resources import path
 import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, AsyncIterable, Dict, List, Optional, Tuple
@@ -20,7 +19,6 @@ from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_auth im
 from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_user_stream_data_source import (
     LighterPerpetualUserStreamDataSource,
 )
-
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -51,13 +49,15 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             self,
             client_config_map: "ClientConfigAdapter",
             lighter_perpetual_wallet_address: str = None,
-            lighter_perpetual_api_secret: SecretStr = None,
+            lighter_perpetual_wallet_private_key: SecretStr = None,
+            lighter_perpetual_api_secret_key: SecretStr = None,
             trading_pairs: Optional[List[str]] = None,
             trading_required: bool = True,
             domain: str = CONSTANTS.DOMAIN,
     ):
         self.lighter_perpetual_wallet_address = lighter_perpetual_wallet_address
-        self.lighter_perpetual_api_secret = lighter_perpetual_api_secret
+        self.lighter_perpetual_wallet_private_key = lighter_perpetual_wallet_private_key
+        self.lighter_perpetual_api_secret_key = lighter_perpetual_api_secret_key
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._domain = domain
@@ -76,7 +76,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def authenticator(self) -> Optional[LighterPerpetualAuth]:
         if self._trading_required:
-            return LighterPerpetualAuth(self.lighter_perpetual_wallet_address, self.lighter_perpetual_api_secret, self)
+            return LighterPerpetualAuth(self.lighter_perpetual_wallet_address, self.lighter_perpetual_wallet_private_key, self.lighter_perpetual_api_secret_key, self)
         return None
 
     @property
@@ -186,7 +186,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             except Exception as e:
                 self.logger().error(f"Failed to fetch details for market_id {market_id}: {e}", exc_info=True)
                 return None
-            
+
         if not self.market_tickers:
             await self._initialize_trading_pair_symbol_map()
 
@@ -738,11 +738,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         Calls the REST API to update total and available balances.
         """
 
-        account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
-                                            params={
-                                                "by": "l1_address",
-                                                "value": self.lighter_perpetual_wallet_address,
-                                            })
+        account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL, params={"by": "l1_address", "value": self.lighter_perpetual_wallet_address})
         quote = CONSTANTS.CURRENCY
 
         first_account = account_info["accounts"][0]
@@ -756,20 +752,14 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         if self._account_index:
             return self._account_index
         else:
-            account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
-                                                params={
-                                                    "by": "l1_address",
-                                                    "value": self.lighter_perpetual_wallet_address,
-                                                })
+            account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL, params={"by": "l1_address", "value": self.lighter_perpetual_wallet_address})
             self._account_index = account_info["accounts"][0]["index"]
             return self._account_index
 
     async def _update_positions(self):
         account_index = await self.get_account_index()
 
-
-        positions = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
-                                         params={"by": "index", "value": account_index})
+        positions = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL, params={"by": "index", "value": account_index})
 
         try:
             accounts = positions.get("accounts", []) if isinstance(positions, dict) else []
@@ -858,8 +848,6 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         return None
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
-        exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        coin = exchange_symbol.split("-")[0]
         market_id = await self._get_market_id_by_coin(trading_pair)
         account_index = await self.get_account_index()
 
@@ -873,8 +861,8 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                                                         "limit": 1
                                                     },
                                                     is_auth_required=True
-                                                )
-        
+                                                    )
+
         try:
             entries = []
             if isinstance(funding_info_response, dict):

@@ -1,23 +1,18 @@
-import ctypes
 import json
-import time
-from collections import OrderedDict
-
-import eth_account
 import logging
-from hummingbot.logger.logger import HummingbotLogger
+import time
+
 import msgpack
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak, to_hex
+from pydantic import SecretStr
 
 from hummingbot.connector.derivative.lighter_perpetual import lighter_perpetual_constants as CONSTANTS
-from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_web_utils import (
-    order_spec_to_order_wire,
-)
 from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_skd import SignerClient
-
+from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_web_utils import order_spec_to_order_wire
 from hummingbot.core.web_assistant.auth import AuthBase
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
+from hummingbot.logger.logger import HummingbotLogger
 
 
 class LighterPerpetualAuth(AuthBase):
@@ -26,10 +21,10 @@ class LighterPerpetualAuth(AuthBase):
     """
     _logger = None
 
-    def __init__(self, api_key: str, api_secret: str, connector: 'LighterPerpetualDerivative'):
-        self._api_key: str = api_key
-        self._api_secret: str = api_secret
-        self.wallet = eth_account.Account.from_key(api_secret)
+    def __init__(self, wallet_address: str, wallet_private_key: SecretStr, api_secret_key: SecretStr, connector):
+        self.wallet_address = wallet_address
+        self.wallet_private_key = wallet_private_key
+        self.api_secret_key = api_secret_key
         self._signer_client = None  # SignerClient instance cached after first use
         self._connector = connector
 
@@ -160,7 +155,7 @@ class LighterPerpetualAuth(AuthBase):
                 account_index = await self._connector.get_account_index()
                 self._signer_client = SignerClient(
                     url=CONSTANTS.PERPETUAL_BASE_URL,
-                    private_key='c8d0abf9d8b4e2719586ced819f433d0f1edcb7935ab48bb7c5bc1fddc9d8bcb9a8259d0547e2769',
+                    private_key=self.api_secret_key,
                     api_key_index=0,
                     account_index=account_index
                 )
