@@ -9,6 +9,11 @@ try:
 except Exception:
     HL_CONSTANTS = None
 
+try:
+    from hummingbot.connector.derivative.lighter_perpetual import lighter_perpetual_constants as LT_CONSTANTS
+except Exception:
+    LT_CONSTANTS = None
+
 from pydantic import Field, field_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
@@ -60,6 +65,13 @@ class FundingRateCollectorConfig(StrategyV2ConfigBase):
         default=True,
         json_schema_extra={
             "prompt": lambda mi: "Use single batch endpoint for Hyperliquid (True/False): ",
+            "prompt_on_new": True,
+        },
+    )
+    use_lighter_batch: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda mi: "Use single batch endpoint for Lighter (True/False): ",
             "prompt_on_new": True,
         },
     )
@@ -209,6 +221,52 @@ class FundingRateCollector(StrategyV2Base):
                             if not m:
                                 continue
                             rate = m.get("funding")
+                            if rate is None:
+                                continue
+                            rows.append(f"{int(timestamp)},{tp},{rate},3600,{next_funding}")
+                        if rows:
+                            file_path = os.path.join(self.config.output_dir, f"{connector_name}_funding_rates.csv")
+                            file_exists = os.path.isfile(file_path)
+                            with open(file_path, 'a') as f:
+                                if not file_exists:
+                                    f.write("timestamp,trading_pair,rate,funding_interval,next_funding_utc_timestamp\n")
+                                f.write("\n".join(rows) + "\n")
+                            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(rows)} funding rows (batch).")
+                        else:
+                            self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding produced 0 rows.")
+                        continue  # proceed to next connector after batch path
+                    except Exception as e:
+                        self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding error {e}.")
+                        continue
+
+                if (connector_name == "lighter_perpetual" and LT_CONSTANTS is not None
+                        and getattr(self.config, 'use_lighter_batch', True)):
+                    try:
+                        data = await connector._api_get(path_url=LT_CONSTANTS.FUNDING_URL)  # type: ignore
+                        rates = []
+                        if isinstance(data, dict):
+                            rates = data.get("funding_rates", []) or []
+                        elif isinstance(data, list):
+                            # Fallback if endpoint ever returns a list
+                            rates = data
+
+                        rate_map = {}
+                        for item in rates:
+                            try:
+                                sym = item.get("symbol")
+                                if sym is None:
+                                    continue
+                                rate_map[sym] = item
+                            except Exception:
+                                continue
+
+                        next_funding = int(((time.time() // 3600) + 1) * 3600)
+                        for tp in pairs:
+                            base = tp.split("-")[0]
+                            m = rate_map.get(base)
+                            if not m:
+                                continue
+                            rate = m.get("rate")
                             if rate is None:
                                 continue
                             rows.append(f"{int(timestamp)},{tp},{rate},3600,{next_funding}")
