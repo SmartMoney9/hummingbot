@@ -34,7 +34,6 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             connector: 'LighterPerpetualDerivative',
             api_factory: WebAssistantsFactory,
             domain: str = CONSTANTS.DOMAIN,
-            initial_order_book = None
     ):
         super().__init__(trading_pairs)
         self._connector = connector
@@ -43,7 +42,6 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._trading_pairs: List[str] = trading_pairs
         self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self._snapshot_messages_queue_key = "order_book_snapshot"
-        self._initial_order_book = initial_order_book
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -89,29 +87,65 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 await self._sleep(CONSTANTS.FUNDING_RATE_UPDATE_INTERNAL_SECOND)
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        if not self._initial_order_book:
-            await self._connector.make_init_order_book_snapshot_request()
-        ex_trading_pair = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        coin = ex_trading_pair.split("-")[0]
+        market_id = None
+        if not self._connector.market_tickers:
+            await self._connector._initialize_trading_pair_symbol_map()
+        for entry in self._connector.market_tickers or []:
+            try:
+                base = entry.get("base")
+                if not base:
+                    continue
+                candidate = f"{base}-{CONSTANTS.CURRENCY}"
+                if candidate == await self._connector.exchange_symbol_associated_to_pair(trading_pair):
+                    market_id = entry.get("market_id")
+                    break
+            except Exception:
+                continue
+
+        if market_id is None:
+            raise ValueError(f"Unable to find market_id for trading pair {trading_pair} when requesting snapshot.")
+
         params = {
-            "type": 'l2Book',
-            "coin": coin
+            "market_id": market_id,
+            "limit": 100,  # maximum allowed according to spec (1 - 100)
         }
 
-        data = await self._connector._api_post(
-            path_url=CONSTANTS.SNAPSHOT_REST_URL,
-            data=params)
+        # New REST endpoint returning L2 order book orders
+        data = await self._connector._api_get(
+            path_url=CONSTANTS.ORDER_BOOK_ORDERS_URL,
+            params=params,
+        )
         return data
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot_response: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
-        snapshot_response.update({"trading_pair": trading_pair})
-        snapshot_msg: OrderBookMessage = OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
-            "trading_pair": snapshot_response["trading_pair"],
-            "update_id": int(snapshot_response['time']),
-            "bids": [[float(i['px']), float(i['sz'])] for i in snapshot_response['levels'][0]],
-            "asks": [[float(i['px']), float(i['sz'])] for i in snapshot_response['levels'][1]],
-        }, timestamp=int(snapshot_response['time']))
+
+        asks = snapshot_response.get("asks", []) or []
+        bids = snapshot_response.get("bids", []) or []
+
+        formatted_asks = [
+            [float(a["price"]), float(a.get("remaining_base_amount") or a.get("initial_base_amount") or 0)]
+            for a in asks
+        ]
+        formatted_bids = [
+            [float(b["price"]), float(b.get("remaining_base_amount") or b.get("initial_base_amount") or 0)]
+            for b in bids
+        ]
+
+        formatted_asks.sort(key=lambda x: x[0])
+        formatted_bids.sort(key=lambda x: x[0], reverse=True)
+
+        update_id = int(time.time() * 1e3)
+        snapshot_msg: OrderBookMessage = OrderBookMessage(
+            OrderBookMessageType.SNAPSHOT,
+            {
+                "trading_pair": trading_pair,
+                "update_id": update_id,
+                "bids": formatted_bids,
+                "asks": formatted_asks,
+            },
+            timestamp=update_id * 1e-3,
+        )
         return snapshot_msg
 
     async def _connected_websocket_assistant(self) -> WSAssistant:

@@ -65,7 +65,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         self._last_trade_history_timestamp = None
         self.coin_to_asset: Dict[str, int] = {}
         self.market_tickers = []
-        self.initial_order_book = None
+        self._account_index = None
         super().__init__(client_config_map)
 
     @property
@@ -76,7 +76,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def authenticator(self) -> Optional[LighterPerpetualAuth]:
         if self._trading_required:
-            return LighterPerpetualAuth(self.lighter_perpetual_wallet_address, self.lighter_perpetual_api_secret)
+            return LighterPerpetualAuth(self.lighter_perpetual_wallet_address, self.lighter_perpetual_api_secret, self)
         return None
 
     @property
@@ -124,7 +124,6 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         return 120
 
     async def _make_network_check_request(self):
-        print("Checking network connection...")
         await self._api_get(path_url=self.check_network_request_path)
 
     def supported_order_types(self) -> List[OrderType]:
@@ -156,27 +155,14 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             auth=self._auth)
 
     async def _make_trading_rules_request(self) -> Any:
-        print("Requesting trading rules from exchange...")
         exchange_info = await self._api_post(path_url=self.trading_rules_request_path,
                                              data={"type": CONSTANTS.ASSET_CONTEXT_TYPE})
         return exchange_info
 
     async def _make_trading_pairs_request(self) -> Any:
-        print("Requesting trading pairs from exchange...")
         exchange_info = await self._api_post(path_url=self.trading_pairs_request_path,
                                              data={"type": CONSTANTS.ASSET_CONTEXT_TYPE})
         return exchange_info
-
-    async def make_init_order_book_snapshot_request(self) -> Any:
-        order_book_details_response = await self._api_get(path_url=CONSTANTS.ORDER_BOOK_DETAILS_URL)
-
-        if order_book_details_response and order_book_details_response.get("order_book_details") and order_book_details_response.get("code") == 200:
-            self.initial_order_book = order_book_details_response.get("order_book_details")
-            return order_book_details_response
-        else:
-            self.logger().error(f"Failed to fetch initial order book snapshot: {order_book_details_response}")
-
-        return None
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
@@ -196,7 +182,6 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             try:
                 path = self.trading_rules_request_path + f"?market_id={market_id}"
                 resp = await self._api_get(path_url=path, limit_id=CONSTANTS.ORDER_BOOK_DETAILS_URL)
-                print(f"Fetched trading rules for market_id {market_id}: {resp}")
                 return resp.get("order_book_details", [])[0]
             except Exception as e:
                 self.logger().error(f"Failed to fetch details for market_id {market_id}: {e}", exc_info=True)
@@ -206,16 +191,10 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             await self._initialize_trading_pair_symbol_map()
 
         market_ids = [m["market_id"] for m in self.market_tickers]
-        print(f"Market IDs to fetch: {market_ids}")
         tasks = [fetch_order_book_detail(mid) for mid in market_ids]
         trading_rules_raw = await asyncio.gather(*tasks)
-        print(f'Fetched {trading_rules_raw} trading rules from the exchange.')
 
         trading_rules_list = self._format_trading_rules(trading_rules_raw)
-
-        print("Updated trading rules:")
-        for rule in trading_rules_list:
-            print(f" - {rule.trading_pair}: {rule}")
 
         self._trading_rules.clear()
         for trading_rule in trading_rules_list:
@@ -224,9 +203,6 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     async def _initialize_trading_pair_symbol_map(self):
         try:
             exchange_info = await self._api_get(path_url=self.trading_pairs_request_path)
-
-            print("Requesting trading pairs from Lighter exchange...")
-            print(exchange_info["order_books"][:5])
 
             self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
         except Exception:
@@ -238,7 +214,6 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self.domain,
-            initial_order_book=self.initial_order_book,
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
@@ -690,19 +665,26 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         return return_val
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+        if self.market_tickers:
+            return
         mapping = bidict()
         self.market_tickers = []
         for symbol_data in filter(web_utils.is_exchange_information_valid, exchange_info.get("order_books", [])):
             base = symbol_data["symbol"]
             market_id = symbol_data["market_id"]
-            status = symbol_data["status"]
+            status = symbol_data.get("status", "inactive")
 
-            if base not in CONSTANTS.BASE_TICKERS:
+            if status != "active":
                 continue
 
             quote = CONSTANTS.CURRENCY
             exchange_symbol = f"{base}-{quote}"
             trading_pair = combine_to_hb_trading_pair(base, quote)
+
+            try:
+                self.coin_to_asset[base] = int(market_id)
+            except Exception:
+                self.coin_to_asset[base] = market_id
 
             self.market_tickers.append({
                 "trading_pair": trading_pair,
@@ -719,8 +701,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                 mapping[exchange_symbol] = trading_pair
 
         self._set_trading_pair_symbol_map(mapping)
-
-        print(f"Initialized trading pairs: {self.market_tickers}")
+        return mapping
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -753,7 +734,6 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             mapping.pop(current_exchange_symbol)
 
     async def _update_balances(self):
-        print("Updating account balances...")
         """
         Calls the REST API to update total and available balances.
         """
@@ -772,41 +752,85 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         self._account_balances[quote] = total_balance
         self._account_available_balances[quote] = available_to_withdraw
 
-        print(f"Total balance: {total_balance}, Available to withdraw: {available_to_withdraw}")
-
-
+    async def get_account_index(self):
+        if self._account_index:
+            return self._account_index
+        else:
+            account_info = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
+                                                params={
+                                                    "by": "l1_address",
+                                                    "value": self.lighter_perpetual_wallet_address,
+                                                })
+            self._account_index = account_info["accounts"][0]["index"]
+            return self._account_index
 
     async def _update_positions(self):
-        positions = await self._api_post(path_url=CONSTANTS.POSITION_INFORMATION_URL,
-                                         data={"type": CONSTANTS.USER_STATE_TYPE}
-                                         )
-        for position in positions["assetPositions"]:
-            position = position.get("position")
-            ex_trading_pair = position.get("coin") + "-" + CONSTANTS.CURRENCY
-            hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(ex_trading_pair)
+        account_index = await self.get_account_index()
 
-            position_side = PositionSide.LONG if Decimal(position.get("szi")) > 0 else PositionSide.SHORT
-            unrealized_pnl = Decimal(position.get("unrealizedPnl"))
-            entry_price = Decimal(position.get("entryPx"))
-            amount = Decimal(position.get("szi", 0))
-            leverage = Decimal(position.get("leverage").get("value"))
-            pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
-            if amount != 0:
-                _position = Position(
-                    trading_pair=hb_trading_pair,
-                    position_side=position_side,
-                    unrealized_pnl=unrealized_pnl,
-                    entry_price=entry_price,
-                    amount=amount,
-                    leverage=leverage
-                )
-                self._perpetual_trading.set_position(pos_key, _position)
+
+        positions = await self._api_get(path_url=CONSTANTS.ACCOUNT_INFO_URL,
+                                         params={"by": "index", "value": account_index})
+
+        try:
+            accounts = positions.get("accounts", []) if isinstance(positions, dict) else []
+            first_account = accounts[0] if accounts else {}
+            pos_list = first_account.get("positions", []) if isinstance(first_account, dict) else []
+
+            seen_position_keys = set()
+            for pos in pos_list:
+                amount = Decimal(pos.get("position", "0") or "0")
+                amount_more_than_zero = amount > 0
+                symbol = pos.get("symbol")
+                if not symbol:
+                    continue
+                ex_trading_pair = f"{symbol}-{CONSTANTS.CURRENCY}"
+                try:
+                    hb_trading_pair = await self.trading_pair_associated_to_exchange_symbol(ex_trading_pair)
+                except Exception:
+                    self.logger().debug(f"Skipping position for unknown symbol {ex_trading_pair}")
+                    continue
+                sign = pos.get("sign")
+
+                position_side = PositionSide.LONG if sign == 1 else PositionSide.SHORT
+                unrealized_pnl = Decimal(pos.get("unrealized_pnl", "0") or "0")
+                entry_price = Decimal(pos.get("avg_entry_price", "0") or "0")
+
+                leverage = Decimal("0")
+                imf_raw = pos.get("initial_margin_fraction")
+                if imf_raw is not None:
+                    try:
+                        imf = Decimal(imf_raw)
+                        if imf > 0:
+                            leverage = (Decimal("100") / imf).quantize(Decimal("1")) if imf <= 100 else imf
+                    except Exception:
+                        pass
+
+                pos_key = self._perpetual_trading.position_key(hb_trading_pair, position_side)
+                seen_position_keys.add(pos_key)
+                if amount_more_than_zero:
+                    _position = Position(
+                        trading_pair=hb_trading_pair,
+                        position_side=position_side,
+                        unrealized_pnl=unrealized_pnl,
+                        entry_price=entry_price,
+                        amount=amount.copy_abs(),  # stored amount should be positive; side indicates direction
+                        leverage=leverage,
+                    )
+                    self._perpetual_trading.set_position(pos_key, _position)
+                else:
+                    self._perpetual_trading.remove_position(pos_key)
+
+            if not pos_list:
+                keys = list(self._perpetual_trading.account_positions.keys())
+                for key in keys:
+                    self._perpetual_trading.remove_position(key)
             else:
-                self._perpetual_trading.remove_position(pos_key)
-        if not positions.get("assetPositions"):
-            keys = list(self._perpetual_trading.account_positions.keys())
-            for key in keys:
-                self._perpetual_trading.remove_position(key)
+                existing_keys = list(self._perpetual_trading.account_positions.keys())
+                for key in existing_keys:
+                    if key not in seen_position_keys:
+                        self._perpetual_trading.remove_position(key)
+        except Exception:
+            self.logger().error("Error parsing positions response", exc_info=True)
 
     async def _get_position_mode(self) -> Optional[PositionMode]:
         return PositionMode.ONEWAY
@@ -824,29 +848,63 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
 
         return True, ""
 
+    async def _get_market_id_by_coin(self, trading_pair: str) -> Optional[str]:
+        if self.market_tickers:
+            for ob in self.market_tickers:
+                symbol = ob.get("trading_pair")
+                if symbol == trading_pair:
+                    market_id = ob.get("market_id")
+                    return int(market_id) if market_id is not None else None
+        return None
+
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[int, Decimal, Decimal]:
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         coin = exchange_symbol.split("-")[0]
+        market_id = await self._get_market_id_by_coin(trading_pair)
+        account_index = await self.get_account_index()
 
-        funding_info_response = await self._api_post(path_url=CONSTANTS.GET_LAST_FUNDING_RATE_PATH_URL,
-                                                     data={
-                                                         "type": "userFunding",
-                                                         "startTime": self._last_funding_time(),
-                                                     }
-                                                     )
-        sorted_payment_response = [i for i in funding_info_response if i["delta"]["coin"] == coin]
-        if len(sorted_payment_response) < 1:
-            timestamp, funding_rate, payment = 0, Decimal("-1"), Decimal("-1")
-            return timestamp, funding_rate, payment
-        funding_payment = sorted_payment_response[0]
-        _payment = Decimal(funding_payment["delta"]["usdc"])
-        funding_rate = Decimal(funding_payment["delta"]["fundingRate"])
-        timestamp = funding_payment["time"] * 1e-3
-        if _payment != Decimal("0"):
-            payment = _payment
-        else:
-            timestamp, funding_rate, payment = 0, Decimal("-1"), Decimal("-1")
-        return timestamp, funding_rate, payment
+        if not market_id or not account_index:
+            raise ValueError(f"Missing market_id or account_index for {trading_pair}")
+
+        funding_info_response = await self._api_get(path_url=CONSTANTS.POSITION_FUNDING_URL,
+                                                    params={
+                                                        "account_index": account_index,
+                                                        "market_id": market_id,
+                                                        "limit": 1
+                                                    },
+                                                    is_auth_required=True
+                                                )
+        
+        try:
+            entries = []
+            if isinstance(funding_info_response, dict):
+                entries = funding_info_response.get("position_fundings", []) or []
+            else:
+                raise ValueError("Invalid funding info response format")
+
+            if market_id is not None:
+                mid_int = market_id
+                entries = [e for e in entries if (isinstance(e, dict) and e.get("market_id", -1) == mid_int)]
+
+            if not entries:
+                return 0, Decimal("-1"), Decimal("-1")
+
+            latest = max(entries, key=lambda e: e.get("timestamp", 0))
+
+            ts = latest.get("timestamp", 0)
+            rate_str = str(latest.get("rate", "0"))
+            change_str = str(latest.get("change", "0"))
+
+            funding_rate = Decimal(rate_str)
+            payment = Decimal(change_str)
+
+            if payment == Decimal("0"):
+                return 0, Decimal("-1"), Decimal("-1")
+
+            return ts, funding_rate, payment
+        except Exception:
+            self.logger().error("Error parsing funding info response", exc_info=True)
+            return 0, Decimal("-1"), Decimal("-1")
 
     def _last_funding_time(self) -> int:
         """
