@@ -225,16 +225,17 @@ class FundingRateCollector(StrategyV2Base):
                             if not m:
                                 continue
                             rate = m.get("funding")
+                            mark_price = m.get("markPx")
                             if rate is None:
                                 continue
                             records.append({
                                 "timestamp": int(timestamp),
                                 "trading_pair": tp,
                                 "rate": rate,
-                                "funding_interval": 3600,
                                 "next_funding_utc_timestamp": next_funding,
                                 "connector": connector_name,
                                 "date": date_str,
+                                "mark_price": mark_price,
                             })
                         if records:
                             self._persist_records(connector_name, records)
@@ -249,20 +250,21 @@ class FundingRateCollector(StrategyV2Base):
                 if (connector_name == "lighter_perpetual" and LT_CONSTANTS is not None
                         and getattr(self.config, 'use_lighter_batch', True)):
                     try:
-                        data = await connector._api_get(path_url=LT_CONSTANTS.FUNDING_URL)  # type: ignore
+                        funding_data = await connector._api_get(path_url=LT_CONSTANTS.FUNDING_URL)  # type: ignore
+                        order_book_data = await connector._api_get(path_url=LT_CONSTANTS.ORDER_BOOK_DETAILS_URL)  # type: ignore
                         rates = []
-                        if isinstance(data, dict):
-                            rates = data.get("funding_rates", []) or []
-                        elif isinstance(data, list):
-                            rates = data
+                        if isinstance(funding_data, dict) and isinstance(order_book_data, dict):
+                            rates = funding_data.get("funding_rates", []) or []
+                            order_book = order_book_data.get("order_book_details", []) or []
 
                         rate_map = {}
                         for item in rates:
                             try:
+                                order_book_item = next((ob for ob in order_book if ob.get("symbol") == item.get("symbol")), {})
                                 sym = item.get("symbol")
                                 if sym is None:
                                     continue
-                                rate_map[sym] = item
+                                rate_map[sym] = {**item, **order_book_item}
                             except Exception:
                                 continue
 
@@ -273,16 +275,17 @@ class FundingRateCollector(StrategyV2Base):
                             if not m:
                                 continue
                             rate = m.get("rate")
+                            last_trade_price = m.get("last_trade_price")
                             if rate is None:
                                 continue
                             records.append({
                                 "timestamp": int(timestamp),
                                 "trading_pair": tp,
                                 "rate": rate,
-                                "funding_interval": 3600,
                                 "next_funding_utc_timestamp": next_funding,
                                 "connector": connector_name,
                                 "date": date_str,
+                                "mark_price": last_trade_price
                             })
                         if records:
                             self._persist_records(connector_name, records)
@@ -346,16 +349,16 @@ class FundingRateCollector(StrategyV2Base):
                         rate = getattr(result, 'rate', None)
                         if rate is None:
                             continue
-                        funding_interval = getattr(result, 'funding_interval', None)
                         next_funding = getattr(result, 'next_funding_utc_timestamp', None)
+                        mark_price = getattr(result, 'mark_price', None)
                         records.append({
                             "timestamp": int(timestamp),
                             "trading_pair": tp,
                             "rate": rate,
-                            "funding_interval": funding_interval,
                             "next_funding_utc_timestamp": next_funding,
                             "connector": connector_name,
                             "date": date_str,
+                            "mark_price": mark_price,
                         })
                 # Simple visibility if we encountered errors.
                 if errors_this_cycle and attempts_this_cycle:
@@ -432,8 +435,8 @@ class FundingRateCollector(StrategyV2Base):
                 'timestamp': pa.array([int(r.get('timestamp')) if r.get('timestamp') is not None else None for r in recs], type=pa.int64()),
                 'trading_pair': pa.array([r.get('trading_pair') for r in recs], type=pa.string()),
                 'rate': pa.array([to_float(r.get('rate')) for r in recs], type=pa.float64()),
-                'funding_interval': pa.array([int(r.get('funding_interval')) if r.get('funding_interval') is not None else None for r in recs], type=pa.int64()),
                 'next_funding_utc_timestamp': pa.array([int(r.get('next_funding_utc_timestamp')) if r.get('next_funding_utc_timestamp') is not None else None for r in recs], type=pa.int64()),
+                'mark_price': pa.array([to_float(r.get('mark_price')) for r in recs], type=pa.float64())
             })
 
             fname = f"part-{int(time.time())}-{uuid4().hex[:8]}.parquet"
