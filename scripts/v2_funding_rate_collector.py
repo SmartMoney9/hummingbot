@@ -1,441 +1,350 @@
-import asyncio
 import os
-import time
-from typing import Any, Dict, List, Set
-from uuid import uuid4
+from decimal import Decimal
+from typing import Dict, List, Set
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-try:
-    from hummingbot.connector.derivative.hyperliquid_perpetual import hyperliquid_perpetual_constants as HL_CONSTANTS
-except Exception:
-    HL_CONSTANTS = None
-
-try:
-    from hummingbot.connector.derivative.lighter_perpetual import lighter_perpetual_constants as LT_CONSTANTS
-except Exception:
-    LT_CONSTANTS = None
-
+import pandas as pd
 from pydantic import Field, field_validator
 
+from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.clock import Clock
-from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.core.event.events import FundingPaymentCompletedEvent
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
-class FundingRateCollectorConfig(StrategyV2ConfigBase):
-    """Configuration for FundingRateCollector script.
-
-    This script collects funding rate information for ALL trading pairs available
-    in the specified perpetual connectors and appends the data to per-connector CSV files.
-    """
+class FundingRateArbitrageConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
-    markets: Dict[str, Set[str]] = {}
-    candles_config: List = []
+    candles_config: List[CandlesConfig] = []
     controllers_config: List[str] = []
-
+    markets: Dict[str, Set[str]] = {}
+    leverage: int = Field(
+        default=20, gt=0,
+        json_schema_extra={"prompt": lambda mi: "Enter the leverage (e.g. 20): ", "prompt_on_new": True},
+    )
+    min_funding_rate_profitability: Decimal = Field(
+        default=0.001,
+        json_schema_extra={
+            "prompt": lambda mi: "Enter the min funding rate profitability to enter in a position (e.g. 0.001): ",
+            "prompt_on_new": True}
+    )
     connectors: Set[str] = Field(
-        default="hyperliquid_perpetual,bybit_perpetual",
+        default="hyperliquid_perpetual,binance_perpetual",
         json_schema_extra={
-            "prompt": lambda mi: "Enter connectors (comma separated, e.g. hyperliquid_perpetual,bybit_perpetual): ",
-            "prompt_on_new": True,
-        },
+            "prompt": lambda mi: "Enter the connectors separated by commas (e.g. hyperliquid_perpetual,binance_perpetual): ",
+            "prompt_on_new": True}
     )
-    polling_interval: int = Field(
-        default=60,
-        json_schema_extra={
-            "prompt": lambda mi: "Enter funding polling interval in seconds (e.g. 60): ",
-            "prompt_on_new": True,
-        },
+    tokens: Set[str] = Field(
+        default="WIF,FET",
+        json_schema_extra={"prompt": lambda mi: "Enter the tokens separated by commas (e.g. WIF,FET): ", "prompt_on_new": True},
     )
-    output_dir: str = Field(
-        default="data/funding_rates",
+    position_size_quote: Decimal = Field(
+        default=100,
         json_schema_extra={
-            "prompt": lambda mi: "Enter output directory for funding files (e.g. data/funding_rates): ",
-            "prompt_on_new": True,
-        },
+            "prompt": lambda mi: "Enter the position size in quote asset (e.g. order amount 100 will open 100 long on hyperliquid and 100 short on binance): ",
+            "prompt_on_new": True
+        }
     )
-    max_pairs_per_cycle: int = Field(
-        default=1000,
+    profitability_to_take_profit: Decimal = Field(
+        default=0.01,
         json_schema_extra={
-            "prompt": lambda mi: "Max pairs per connector per cycle (round-robin, e.g. 150): ",
-            "prompt_on_new": True,
-        },
+            "prompt": lambda mi: "Enter the profitability to take profit (including PNL of positions and fundings received): ",
+            "prompt_on_new": True}
     )
-    use_hyperliquid_batch: bool = Field(
-        default=True,
+    funding_rate_diff_stop_loss: Decimal = Field(
+        default=-0.001,
         json_schema_extra={
-            "prompt": lambda mi: "Use single batch endpoint for Hyperliquid (True/False): ",
-            "prompt_on_new": True,
-        },
+            "prompt": lambda mi: "Enter the funding rate difference to stop the position (e.g. -0.001): ",
+            "prompt_on_new": True}
     )
-    use_lighter_batch: bool = Field(
-        default=True,
+    trade_profitability_condition_to_enter: bool = Field(
+        default=False,
         json_schema_extra={
-            "prompt": lambda mi: "Use single batch endpoint for Lighter (True/False): ",
-            "prompt_on_new": True,
-        },
+            "prompt": lambda mi: "Do you want to check the trade profitability condition to enter? (True/False): ",
+            "prompt_on_new": True}
     )
 
-    @field_validator("connectors", mode="before")
+    @field_validator("connectors", "tokens", mode="before")
     @classmethod
-    def parse_connectors(cls, v):
+    def validate_sets(cls, v):
         if isinstance(v, str):
-            return {c.strip() for c in v.split(",") if c.strip()}
+            return set(v.split(","))
         return v
 
 
-class FundingRateCollector(StrategyV2Base):
-    """Strategy script that periodically collects funding rates for all available pairs.
-
-    Workflow:
-    1. On start(): schedule async discovery of all trading pairs per connector.
-    2. Filter pairs optionally by quote asset.
-    3. Periodically (polling_interval) fetch funding info via connector.get_funding_info(trading_pair).
-    4. Append rows to CSV file per connector: <output_dir>/<connector>_funding_rates.csv.
-    5. Each row: timestamp, trading_pair, rate, funding_interval, next_funding_utc_timestamp.
-    """
-
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: FundingRateCollectorConfig):
-        super().__init__(connectors, config)
-        self.config = config
-        self._connector_pairs = {name: [] for name in self.config.connectors}
-        self._funding_task = None
-        self._discovery_tasks = []
-        self._discovery_attempted = set()
-        self._discovery_completed = set()
-        os.makedirs(self.config.output_dir, exist_ok=True)
-        self._poll_offsets = {}
-        self._collecting = False
+class FundingRateArbitrage(StrategyV2Base):
+    quote_markets_map = {
+        "hyperliquid_perpetual": "USD",
+        "binance_perpetual": "USDT"
+    }
+    funding_payment_interval_map = {
+        "binance_perpetual": 60 * 60 * 8,
+        "hyperliquid_perpetual": 60 * 60 * 1
+    }
+    funding_profitability_interval = 60 * 60 * 24
 
     @classmethod
-    def init_markets(cls, config: FundingRateCollectorConfig):  # type: ignore
-        """Provide a minimal markets mapping so Hummingbot instantiates the requested connectors.
+    def get_trading_pair_for_connector(cls, token, connector):
+        return f"{token}-{cls.quote_markets_map.get(connector, 'USDT')}"
 
-        If the user did not specify markets, we synthesize one placeholder pair per connector.
-        Later, we discover the full list via all_trading_pairs().
-        """
-        if config.markets:
-            cls.markets = config.markets
-            return
+    @classmethod
+    def init_markets(cls, config: FundingRateArbitrageConfig):
+        markets = {}
+        for connector in config.connectors:
+            trading_pairs = {cls.get_trading_pair_for_connector(token, connector) for token in config.tokens}
+            markets[connector] = trading_pairs
+        cls.markets = markets
 
-        placeholder_map = {
-            "bybit_perpetual": "BTC-USDT",
-            "hyperliquid_perpetual": "BTC-USD",
-            "lighter_perpetual": "BTC-USD",
-        }
-        synthesized: Dict[str, Set[str]] = {}
-        for name in config.connectors:
-            placeholder = placeholder_map.get(name)
-            if placeholder is None:
-                placeholder = "BTC-USDT"
-            synthesized[name] = {placeholder}
-        cls.markets = synthesized
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: FundingRateArbitrageConfig):
+        super().__init__(connectors, config)
+        self.config = config
+        self.active_funding_arbitrages = {}
+        self.stopped_funding_arbitrages = {token: [] for token in self.config.tokens}
 
     def start(self, clock: Clock, timestamp: float) -> None:
+        """
+        Start the strategy.
+        :param clock: Clock to use.
+        :param timestamp: Current time.
+        """
         self._last_timestamp = timestamp
-        self._funding_task = safe_ensure_future(self._poll_funding_loop())
+        self.apply_initial_setting()
 
-    def on_tick(self):
-        """Override to trigger a single discovery per connector once it's ready."""
-        super().on_tick()
-        if not self.ready_to_trade:
-            return
-        for connector_name in self.config.connectors:
-            if connector_name in self._discovery_attempted:
-                continue  # already attempted (one-shot per requirement)
-            connector = self.connectors.get(connector_name)
-            if connector is None:
-                self.logger().warning(f"[FUNDING-COLLECTOR] Configured connector '{connector_name}' not found.")
-                self._discovery_attempted.add(connector_name)
-                continue
-            if not connector.ready:
-                # Wait until connector.ready before attempting (no spam)
-                continue
-            self._discovery_attempted.add(connector_name)
-            task = safe_ensure_future(self._discover_pairs(connector_name, connector))
-            self._discovery_tasks.append(task)
+    def apply_initial_setting(self):
+        for connector_name, connector in self.connectors.items():
+            if self.is_perpetual(connector_name):
+                position_mode = PositionMode.ONEWAY if connector_name == "hyperliquid_perpetual" else PositionMode.HEDGE
+                connector.set_position_mode(position_mode)
+                for trading_pair in self.market_data_provider.get_trading_pairs(connector_name):
+                    connector.set_leverage(trading_pair, self.config.leverage)
 
-    async def _discover_pairs(self, connector_name: str, connector: ConnectorBase):
-        try:
-            all_pairs = await connector.all_trading_pairs()
-            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: one-time discovery returned {len(all_pairs)} raw pairs.")
-            unique_pairs = sorted(set(all_pairs))
-            self._connector_pairs[connector_name] = unique_pairs
-            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: discovered {len(unique_pairs)} trading pairs for monitoring.")
-            if len(unique_pairs) == 0:
-                self.logger().warning(
-                    f"[FUNDING-COLLECTOR] {connector_name}: discovery returned 0 pairs (no further retries as per one-shot configuration)."
-                )
+    def get_funding_info_by_token(self, token):
+        """
+        This method provides the funding rates across all the connectors
+        """
+        funding_rates = {}
+        for connector_name, connector in self.connectors.items():
+            trading_pair = self.get_trading_pair_for_connector(token, connector_name)
+            funding_rates[connector_name] = connector.get_funding_info(trading_pair)
+        return funding_rates
+
+    def get_current_profitability_after_fees(self, token: str, connector_1: str, connector_2: str, side: TradeType):
+        """
+        This methods compares the profitability of buying at market in the two exchanges. If the side is TradeType.BUY
+        means that the operation is long on connector 1 and short on connector 2.
+        """
+        trading_pair_1 = self.get_trading_pair_for_connector(token, connector_1)
+        trading_pair_2 = self.get_trading_pair_for_connector(token, connector_2)
+
+        connector_1_price = Decimal(self.market_data_provider.get_price_for_quote_volume(
+            connector_name=connector_1,
+            trading_pair=trading_pair_1,
+            quote_volume=self.config.position_size_quote,
+            is_buy=side == TradeType.BUY,
+        ).result_price)
+        connector_2_price = Decimal(self.market_data_provider.get_price_for_quote_volume(
+            connector_name=connector_2,
+            trading_pair=trading_pair_2,
+            quote_volume=self.config.position_size_quote,
+            is_buy=side != TradeType.BUY,
+        ).result_price)
+        estimated_fees_connector_1 = self.connectors[connector_1].get_fee(
+            base_currency=trading_pair_1.split("-")[0],
+            quote_currency=trading_pair_1.split("-")[1],
+            order_type=OrderType.MARKET,
+            order_side=TradeType.BUY,
+            amount=self.config.position_size_quote / connector_1_price,
+            price=connector_1_price,
+            is_maker=False,
+            position_action=PositionAction.OPEN
+        ).percent
+        estimated_fees_connector_2 = self.connectors[connector_2].get_fee(
+            base_currency=trading_pair_2.split("-")[0],
+            quote_currency=trading_pair_2.split("-")[1],
+            order_type=OrderType.MARKET,
+            order_side=TradeType.BUY,
+            amount=self.config.position_size_quote / connector_2_price,
+            price=connector_2_price,
+            is_maker=False,
+            position_action=PositionAction.OPEN
+        ).percent
+
+        if side == TradeType.BUY:
+            estimated_trade_pnl_pct = (connector_2_price - connector_1_price) / connector_1_price
+        else:
+            estimated_trade_pnl_pct = (connector_1_price - connector_2_price) / connector_2_price
+        return estimated_trade_pnl_pct - estimated_fees_connector_1 - estimated_fees_connector_2
+
+    def get_most_profitable_combination(self, funding_info_report: Dict):
+        best_combination = None
+        highest_profitability = 0
+        for connector_1 in funding_info_report:
+            for connector_2 in funding_info_report:
+                if connector_1 != connector_2:
+                    rate_connector_1 = self.get_normalized_funding_rate_in_seconds(funding_info_report, connector_1)
+                    rate_connector_2 = self.get_normalized_funding_rate_in_seconds(funding_info_report, connector_2)
+                    funding_rate_diff = abs(rate_connector_1 - rate_connector_2) * self.funding_profitability_interval
+                    if funding_rate_diff > highest_profitability:
+                        trade_side = TradeType.BUY if rate_connector_1 < rate_connector_2 else TradeType.SELL
+                        highest_profitability = funding_rate_diff
+                        best_combination = (connector_1, connector_2, trade_side, funding_rate_diff)
+        return best_combination
+
+    def get_normalized_funding_rate_in_seconds(self, funding_info_report, connector_name):
+        return funding_info_report[connector_name].rate / self.funding_payment_interval_map.get(connector_name, 60 * 60 * 8)
+
+    def create_actions_proposal(self) -> List[CreateExecutorAction]:
+        """
+        In this method we are going to evaluate if a new set of positions has to be created for each of the tokens that
+        don't have an active arbitrage.
+        More filters can be applied to limit the creation of the positions, since the current logic is only checking for
+        positive pnl between funding rate. Is logged and computed the trading profitability at the time for entering
+        at market to open the possibilities for other people to create variations like sending limit position executors
+        and if one gets filled buy market the other one to improve the entry prices.
+        """
+        create_actions = []
+        for token in self.config.tokens:
+            if token not in self.active_funding_arbitrages:
+                funding_info_report = self.get_funding_info_by_token(token)
+                best_combination = self.get_most_profitable_combination(funding_info_report)
+                connector_1, connector_2, trade_side, expected_profitability = best_combination
+                if expected_profitability >= self.config.min_funding_rate_profitability:
+                    current_profitability = self.get_current_profitability_after_fees(
+                        token, connector_1, connector_2, trade_side
+                    )
+                    if self.config.trade_profitability_condition_to_enter:
+                        if current_profitability < 0:
+                            self.logger().info(f"Best Combination: {connector_1} | {connector_2} | {trade_side}"
+                                               f"Funding rate profitability: {expected_profitability}"
+                                               f"Trading profitability after fees: {current_profitability}"
+                                               f"Trade profitability is negative, skipping...")
+                            continue
+                    self.logger().info(f"Best Combination: {connector_1} | {connector_2} | {trade_side}"
+                                       f"Funding rate profitability: {expected_profitability}"
+                                       f"Trading profitability after fees: {current_profitability}"
+                                       f"Starting executors...")
+                    position_executor_config_1, position_executor_config_2 = self.get_position_executors_config(token, connector_1, connector_2, trade_side)
+                    self.active_funding_arbitrages[token] = {
+                        "connector_1": connector_1,
+                        "connector_2": connector_2,
+                        "executors_ids": [position_executor_config_1.id, position_executor_config_2.id],
+                        "side": trade_side,
+                        "funding_payments": [],
+                    }
+                    return [CreateExecutorAction(executor_config=position_executor_config_1),
+                            CreateExecutorAction(executor_config=position_executor_config_2)]
+        return create_actions
+
+    def stop_actions_proposal(self) -> List[StopExecutorAction]:
+        """
+        Once the funding rate arbitrage is created we are going to control the funding payments pnl and the current
+        pnl of each of the executors at the cost of closing the open position at market.
+        If that PNL is greater than the profitability_to_take_profit
+        """
+        stop_executor_actions = []
+        for token, funding_arbitrage_info in self.active_funding_arbitrages.items():
+            executors = self.filter_executors(
+                executors=self.get_all_executors(),
+                filter_func=lambda x: x.id in funding_arbitrage_info["executors_ids"]
+            )
+            funding_payments_pnl = sum(funding_payment.amount for funding_payment in funding_arbitrage_info["funding_payments"])
+            executors_pnl = sum(executor.net_pnl_quote for executor in executors)
+            take_profit_condition = executors_pnl + funding_payments_pnl > self.config.profitability_to_take_profit * self.config.position_size_quote
+            funding_info_report = self.get_funding_info_by_token(token)
+            if funding_arbitrage_info["side"] == TradeType.BUY:
+                funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"])
             else:
-                self._discovery_completed.add(connector_name)
-                # Kick off an immediate funding collection so we don't wait a full polling interval.
-                safe_ensure_future(self._collect_all())
-        except Exception as e:
-            self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: discovery failed with error: {e} (no retry).")
+                funding_rate_diff = self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_1"]) - self.get_normalized_funding_rate_in_seconds(funding_info_report, funding_arbitrage_info["connector_2"])
+            current_funding_condition = funding_rate_diff * self.funding_profitability_interval < self.config.funding_rate_diff_stop_loss
+            if take_profit_condition:
+                self.logger().info("Take profit profitability reached, stopping executors")
+                self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+                stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+            elif current_funding_condition:
+                self.logger().info("Funding rate difference reached for stop loss, stopping executors")
+                self.stopped_funding_arbitrages[token].append(funding_arbitrage_info)
+                stop_executor_actions.extend([StopExecutorAction(executor_id=executor.id) for executor in executors])
+        return stop_executor_actions
 
-    async def _poll_funding_loop(self):
-        while True:
-            try:
-                await self._collect_all()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self.logger().warning(f"[FUNDING-COLLECTOR] Error during collection cycle: {e}")
-            await asyncio.sleep(self.config.polling_interval)
+    def did_complete_funding_payment(self, funding_payment_completed_event: FundingPaymentCompletedEvent):
+        """
+        Based on the funding payment event received, check if one of the active arbitrages matches to add the event
+        to the list.
+        """
+        token = funding_payment_completed_event.trading_pair.split("-")[0]
+        if token in self.active_funding_arbitrages:
+            self.active_funding_arbitrages[token]["funding_payments"].append(funding_payment_completed_event)
 
-    async def _collect_all(self):
-        if not self.ready_to_trade:
-            return
-        # Prevent overlapping full-connector collection cycles (could cause duplicate CSV rows)
-        if self._collecting:
-            return
-        self._collecting = True
-        timestamp = self.current_timestamp
-        try:
-            for connector_name, pairs in self._connector_pairs.items():
-                connector = self.connectors.get(connector_name)
-                if connector is None or not pairs:
-                    if connector is not None and len(pairs) == 0:
-                        self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: no pairs yet to collect funding.")
-                    continue
+    def get_position_executors_config(self, token, connector_1, connector_2, trade_side):
+        price = self.market_data_provider.get_price_by_type(
+            connector_name=connector_1,
+            trading_pair=self.get_trading_pair_for_connector(token, connector_1),
+            price_type=PriceType.MidPrice
+        )
+        position_amount = self.config.position_size_quote / price
 
-                records: List[Dict[str, Any]] = []
-                date_str = time.strftime('%Y-%m-%d', time.gmtime(timestamp))
-
-                # Hyperliquid optimized batch path (optional)
-                if (connector_name == "hyperliquid_perpetual" and HL_CONSTANTS is not None
-                        and getattr(self.config, 'use_hyperliquid_batch', True)):
-                    try:
-                        data = await connector._api_post(path_url=HL_CONSTANTS.EXCHANGE_INFO_URL, data={"type": HL_CONSTANTS.ASSET_CONTEXT_TYPE})  # type: ignore
-                        universe = data[0].get("universe", []) if isinstance(data, list) and len(data) > 0 else []
-                        metrics = data[1] if isinstance(data, list) and len(data) > 1 else []
-                        coin_map = {}
-                        for idx, item in enumerate(universe):
-                            try:
-                                coin_map[item.get("name")] = metrics[idx]
-                            except Exception:
-                                continue
-                        next_funding = int(((time.time() // 3600) + 1) * 3600)
-                        for tp in pairs:
-                            base = tp.split("-")[0]
-                            m = coin_map.get(base)
-                            if not m:
-                                continue
-                            rate = m.get("funding")
-                            if rate is None:
-                                continue
-                            records.append({
-                                "timestamp": int(timestamp),
-                                "trading_pair": tp,
-                                "rate": rate,
-                                "funding_interval": 3600,
-                                "next_funding_utc_timestamp": next_funding,
-                                "connector": connector_name,
-                                "date": date_str,
-                            })
-                        if records:
-                            self._persist_records(connector_name, records)
-                            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(records)} funding rows (batch).")
-                        else:
-                            self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding produced 0 rows.")
-                        continue  # proceed to next connector after batch path
-                    except Exception as e:
-                        self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding error {e}.")
-                        continue
-
-                if (connector_name == "lighter_perpetual" and LT_CONSTANTS is not None
-                        and getattr(self.config, 'use_lighter_batch', True)):
-                    try:
-                        data = await connector._api_get(path_url=LT_CONSTANTS.FUNDING_URL)  # type: ignore
-                        rates = []
-                        if isinstance(data, dict):
-                            rates = data.get("funding_rates", []) or []
-                        elif isinstance(data, list):
-                            rates = data
-
-                        rate_map = {}
-                        for item in rates:
-                            try:
-                                sym = item.get("symbol")
-                                if sym is None:
-                                    continue
-                                rate_map[sym] = item
-                            except Exception:
-                                continue
-
-                        next_funding = int(((time.time() // 3600) + 1) * 3600)
-                        for tp in pairs:
-                            base = tp.split("-")[0]
-                            m = rate_map.get(base)
-                            if not m:
-                                continue
-                            rate = m.get("rate")
-                            if rate is None:
-                                continue
-                            records.append({
-                                "timestamp": int(timestamp),
-                                "trading_pair": tp,
-                                "rate": rate,
-                                "funding_interval": 3600,
-                                "next_funding_utc_timestamp": next_funding,
-                                "connector": connector_name,
-                                "date": date_str,
-                            })
-                        if records:
-                            self._persist_records(connector_name, records)
-                            self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(records)} funding rows (batch).")
-                        else:
-                            self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding produced 0 rows.")
-                        continue  # proceed to next connector after batch path
-                    except Exception as e:
-                        self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: batch funding error {e}.")
-                        continue
-
-                # Other connectors: round-robin slice + throttled async fetch
-                max_pairs_cycle = max(1, getattr(self.config, 'max_pairs_per_cycle', len(pairs)))
-                if len(pairs) > max_pairs_cycle:
-                    offset = self._poll_offsets.get(connector_name, 0)
-                    end = offset + max_pairs_cycle
-                    if end <= len(pairs):
-                        target_pairs = pairs[offset:end]
-                    else:
-                        target_pairs = pairs[offset:] + pairs[:end - len(pairs)]
-                    self._poll_offsets[connector_name] = end % len(pairs)
-                    self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: polling {len(target_pairs)} pairs this cycle (offset {offset}/{len(pairs)}).")
-                else:
-                    target_pairs = pairs
-
-                orderbook_ds = getattr(connector, "_orderbook_ds", None)
-                use_async_ds = orderbook_ds is not None and hasattr(orderbook_ds, "get_funding_info")
-
-                async def fetch_funding(tp: str):
-                    try:
-                        if use_async_ds:
-                            result = await orderbook_ds.get_funding_info(tp)  # type: ignore
-                        else:
-                            result = connector.get_funding_info(tp)
-                        return tp, result, None
-                    except Exception as e:
-                        return tp, None, e
-
-                batch_size = 200
-                errors_this_cycle = 0
-                attempts_this_cycle = 0
-                for i in range(0, len(target_pairs), batch_size):
-                    batch_pairs = target_pairs[i:i + batch_size]
-                    batch = [fetch_funding(tp) for tp in batch_pairs]
-                    try:
-                        results = await asyncio.gather(*batch, return_exceptions=True)
-                    except Exception as e:
-                        self.logger().warning(f"[FUNDING-COLLECTOR] {connector_name}: funding batch error: {e}")
-                        continue
-                    for item in results:
-                        if isinstance(item, Exception) or item is None:
-                            continue
-                        try:
-                            tp, result, err = item
-                        except Exception:
-                            continue
-                        attempts_this_cycle += 1
-                        if err is not None or result is None:
-                            errors_this_cycle += 1
-                            continue
-                        rate = getattr(result, 'rate', None)
-                        if rate is None:
-                            continue
-                        funding_interval = getattr(result, 'funding_interval', None)
-                        next_funding = getattr(result, 'next_funding_utc_timestamp', None)
-                        records.append({
-                            "timestamp": int(timestamp),
-                            "trading_pair": tp,
-                            "rate": rate,
-                            "funding_interval": funding_interval,
-                            "next_funding_utc_timestamp": next_funding,
-                            "connector": connector_name,
-                            "date": date_str,
-                        })
-                # Simple visibility if we encountered errors.
-                if errors_this_cycle and attempts_this_cycle:
-                    self.logger().info(
-                        f"[FUNDING-COLLECTOR] {connector_name}: {errors_this_cycle}/{attempts_this_cycle} funding fetch errors this cycle.")
-                if records:
-                    self._persist_records(connector_name, records)
-                    self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: appended {len(records)} funding rows.")
-                else:
-                    self.logger().info(f"[FUNDING-COLLECTOR] {connector_name}: no funding rows this cycle.")
-        finally:
-            self._collecting = False
-
-    async def on_stop(self):
-        if self._funding_task is not None:
-            self._funding_task.cancel()
-            try:
-                await self._funding_task
-            except Exception:
-                pass
-        for t in self._discovery_tasks:
-            if not t.done():
-                t.cancel()
-        if self._discovery_tasks:
-            await asyncio.gather(*self._discovery_tasks, return_exceptions=True)
-        await super().on_stop()
-
-    # Override abstract methods from StrategyV2Base with no-op implementations
-    def create_actions_proposal(self):  # type: ignore
-        return []
-
-    def stop_actions_proposal(self):  # type: ignore
-        return []
-
-    def store_actions_proposal(self):  # type: ignore
-        return []
+        position_executor_config_1 = PositionExecutorConfig(
+            timestamp=self.current_timestamp,
+            connector_name=connector_1,
+            trading_pair=self.get_trading_pair_for_connector(token, connector_1),
+            side=trade_side,
+            amount=position_amount,
+            leverage=self.config.leverage,
+            triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
+        )
+        position_executor_config_2 = PositionExecutorConfig(
+            timestamp=self.current_timestamp,
+            connector_name=connector_2,
+            trading_pair=self.get_trading_pair_for_connector(token, connector_2),
+            side=TradeType.BUY if trade_side == TradeType.SELL else TradeType.SELL,
+            amount=position_amount,
+            leverage=self.config.leverage,
+            triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.MARKET),
+        )
+        return position_executor_config_1, position_executor_config_2
 
     def format_status(self) -> str:
-        discovered = {k: len(v) for k, v in self._connector_pairs.items()}
-        lines = ["Funding Rate Collector", f"Pairs discovered: {discovered}"]
-        return "\n".join(lines)
+        original_status = super().format_status()
+        funding_rate_status = []
+        if self.ready_to_trade:
+            all_funding_info = []
+            all_best_paths = []
+            for token in self.config.tokens:
+                token_info = {"token": token}
+                best_paths_info = {"token": token}
+                funding_info_report = self.get_funding_info_by_token(token)
+                best_combination = self.get_most_profitable_combination(funding_info_report)
+                for connector_name, info in funding_info_report.items():
+                    token_info[f"{connector_name} Rate (%)"] = self.get_normalized_funding_rate_in_seconds(funding_info_report, connector_name) * self.funding_profitability_interval * 100
+                connector_1, connector_2, side, funding_rate_diff = best_combination
+                profitability_after_fees = self.get_current_profitability_after_fees(token, connector_1, connector_2, side)
+                best_paths_info["Best Path"] = f"{connector_1}_{connector_2}"
+                best_paths_info["Best Rate Diff (%)"] = funding_rate_diff * 100
+                best_paths_info["Trade Profitability (%)"] = profitability_after_fees * 100
+                best_paths_info["Days Trade Prof"] = - profitability_after_fees / funding_rate_diff
+                best_paths_info["Days to TP"] = (self.config.profitability_to_take_profit - profitability_after_fees) / funding_rate_diff
 
-    def _persist_records(self, connector_name: str, records: List[Dict[str, Any]]):
-        if not records:
-            return
-        try:
-            self._parquet_append(connector_name, records)
-            return
+                time_to_next_funding_info_c1 = funding_info_report[connector_1].next_funding_utc_timestamp - self.current_timestamp
+                time_to_next_funding_info_c2 = funding_info_report[connector_2].next_funding_utc_timestamp - self.current_timestamp
+                best_paths_info["Min to Funding 1"] = time_to_next_funding_info_c1 / 60
+                best_paths_info["Min to Funding 2"] = time_to_next_funding_info_c2 / 60
 
-        except Exception as e:
-            self.logger().warning(f"[FUNDING-COLLECTOR] CSV write also failed: {e}.")
-
-    def _parquet_append(self, connector_name: str, records: List[Dict[str, Any]]):
-        by_date: Dict[str, List[Dict[str, Any]]] = {}
-        for r in records:
-            ts = r.get('timestamp') or time.time()
-            d = time.strftime('%Y-%m-%d', time.gmtime(int(ts)))
-            by_date.setdefault(d, []).append(r)
-
-        base_dir = os.path.join(self.config.output_dir, 'parquet', connector_name)
-        os.makedirs(base_dir, exist_ok=True)
-
-        for date_str, recs in by_date.items():
-            day_dir = os.path.join(base_dir, date_str)
-            os.makedirs(day_dir, exist_ok=True)
-
-            def to_float(v):
-                try:
-                    return float(v) if v is not None else None
-                except Exception:
-                    return None
-
-            table = pa.table({
-                'timestamp': pa.array([int(r.get('timestamp')) if r.get('timestamp') is not None else None for r in recs], type=pa.int64()),
-                'trading_pair': pa.array([r.get('trading_pair') for r in recs], type=pa.string()),
-                'rate': pa.array([to_float(r.get('rate')) for r in recs], type=pa.float64()),
-                'funding_interval': pa.array([int(r.get('funding_interval')) if r.get('funding_interval') is not None else None for r in recs], type=pa.int64()),
-                'next_funding_utc_timestamp': pa.array([int(r.get('next_funding_utc_timestamp')) if r.get('next_funding_utc_timestamp') is not None else None for r in recs], type=pa.int64()),
-            })
-
-            fname = f"part-{int(time.time())}-{uuid4().hex[:8]}.parquet"
-            file_path = os.path.join(day_dir, fname)
-            pq.write_table(table, file_path, compression='zstd')
+                all_funding_info.append(token_info)
+                all_best_paths.append(best_paths_info)
+            funding_rate_status.append(f"\n\n\nMin Funding Rate Profitability: {self.config.min_funding_rate_profitability:.2%}")
+            funding_rate_status.append(f"Profitability to Take Profit: {self.config.profitability_to_take_profit:.2%}\n")
+            funding_rate_status.append("Funding Rate Info (Funding Profitability in Days): ")
+            funding_rate_status.append(format_df_for_printout(df=pd.DataFrame(all_funding_info), table_format="psql",))
+            funding_rate_status.append(format_df_for_printout(df=pd.DataFrame(all_best_paths), table_format="psql",))
+            for token, funding_arbitrage_info in self.active_funding_arbitrages.items():
+                long_connector = funding_arbitrage_info["connector_1"] if funding_arbitrage_info["side"] == TradeType.BUY else funding_arbitrage_info["connector_2"]
+                short_connector = funding_arbitrage_info["connector_2"] if funding_arbitrage_info["side"] == TradeType.BUY else funding_arbitrage_info["connector_1"]
+                funding_rate_status.append(f"Token: {token}")
+                funding_rate_status.append(f"Long connector: {long_connector} | Short connector: {short_connector}")
+                funding_rate_status.append(f"Funding Payments Collected: {funding_arbitrage_info['funding_payments']}")
+                funding_rate_status.append(f"Executors: {funding_arbitrage_info['executors_ids']}")
+                funding_rate_status.append("-" * 50 + "\n")
+        return original_status + "\n".join(funding_rate_status)
